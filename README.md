@@ -48,7 +48,25 @@ Optional flags:
 --timeout-ms 150
 --seed 1
 --verbose
+--log-dir logs
+--viz-dir visualizations
+--visualize=true
 ```
+
+By default, each run now saves the terminal output to `logs/<scenario>.txt` and calls the Python visualizer to create `visualizations/<scenario>.html`:
+
+```bash
+go run ./cmd/hotstuff-sim --scenario byzantine-equivocation --timeout-ms 1000
+xdg-open visualizations/byzantine-equivocation.html
+```
+
+You can also call the visualizer manually:
+
+```bash
+python3 scripts/visualize_log.py --log logs/happy.txt --out visualizations/happy.html
+```
+
+See `docs/VISUALIZATION.md` for details.
 
 Run tests:
 

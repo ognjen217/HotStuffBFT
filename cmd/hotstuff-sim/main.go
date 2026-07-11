@@ -14,10 +14,10 @@ import (
 )
 
 func main() {
-	name := flag.String("scenario", "happy", "scenario to run: happy, silent-leader, byzantine-equivocation, banking-block-transfer, delayed-network")
+	name := flag.String("scenario", "happy", "scenario to run: happy, silent-leader, byzantine-equivocation, byzantine-forged-qc, banking-block-transfer, delayed-network")
 	n := flag.Int("n", 4, "number of replicas")
 	f := flag.Int("f", 1, "maximum Byzantine replicas")
-	timeoutMS := flag.Int("timeout-ms", 150, "view timeout in milliseconds")
+	timeoutMS := flag.Int("timeout-ms", 150, "initial view timeout in milliseconds; the pacemaker backs off exponentially")
 	seed := flag.Int64("seed", 1, "deterministic random seed")
 	verbose := flag.Bool("verbose", false, "print network-level trace entries")
 	logDir := flag.String("log-dir", "logs", "directory where terminal log output is saved; use an empty value to disable file logging")
@@ -25,7 +25,7 @@ func main() {
 	visualize := flag.Bool("visualize", true, "after saving the log, call scripts/visualize_log.py and create an HTML visualization")
 	flag.Parse()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
 	result, err := scenario.Run(ctx, scenario.Config{

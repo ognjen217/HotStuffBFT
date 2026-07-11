@@ -69,3 +69,12 @@ func (c Config) LeaderForView(view int) string {
 	}
 	return c.ReplicaIDs[idx]
 }
+
+func (c Config) ContainsReplica(id string) bool {
+	for _, candidate := range c.ReplicaIDs {
+		if candidate == id {
+			return true
+		}
+	}
+	return false
+}

@@ -3,84 +3,46 @@ package hotstuff
 import (
 	"errors"
 	"fmt"
-	"sort"
 )
 
 type Vote struct {
-	VoterID string
-	Phase   Phase
-	View    int
-	NodeID  string
+	VoterID          string
+	Phase            Phase
+	View             int
+	NodeID           string
+	PartialSignature string
 }
 
 type QC struct {
-	Phase   Phase
-	View    int
-	NodeID  string
-	Voters  []string
-	Votes   []Vote
-	Quorum  int
-	Genesis bool
+	Phase              Phase
+	View               int
+	NodeID             string
+	AggregateSignature string
+	Genesis            bool
 }
 
 func GenesisQC() *QC {
-	return &QC{Phase: PhaseGenesis, View: 0, NodeID: GenesisID, Quorum: 0, Genesis: true}
+	return &QC{Phase: PhaseGenesis, View: 0, NodeID: GenesisID, Genesis: true}
 }
 
-func NewQC(phase Phase, view int, nodeID string, votes []Vote, quorum int) (*QC, error) {
-	if quorum <= 0 {
-		return nil, errors.New("quorum must be positive")
+func NewQC(phase Phase, view int, nodeID string, votes []Vote, quorum int, crypto *ReplicaCrypto) (*QC, error) {
+	if crypto == nil {
+		return nil, errors.New("threshold crypto is required")
 	}
-	seen := make(map[string]Vote)
-	for _, vote := range votes {
-		if vote.VoterID == "" {
-			return nil, errors.New("vote with empty voter id")
-		}
-		if vote.Phase != phase || vote.View != view || vote.NodeID != nodeID {
-			return nil, fmt.Errorf("vote mismatch: got (%s,%d,%s), want (%s,%d,%s)", vote.Phase, vote.View, vote.NodeID, phase, view, nodeID)
-		}
-		seen[vote.VoterID] = vote
+	aggregate, err := crypto.Combine(phase, view, nodeID, votes, quorum)
+	if err != nil {
+		return nil, err
 	}
-	if len(seen) < quorum {
-		return nil, fmt.Errorf("not enough unique voters: got %d need %d", len(seen), quorum)
-	}
-	voters := make([]string, 0, len(seen))
-	uniqVotes := make([]Vote, 0, len(seen))
-	for voter, vote := range seen {
-		voters = append(voters, voter)
-		uniqVotes = append(uniqVotes, vote)
-	}
-	sort.Strings(voters)
-	sort.Slice(uniqVotes, func(i, j int) bool { return uniqVotes[i].VoterID < uniqVotes[j].VoterID })
-	return &QC{Phase: phase, View: view, NodeID: nodeID, Voters: voters, Votes: uniqVotes, Quorum: quorum}, nil
+	return &QC{
+		Phase:              phase,
+		View:               view,
+		NodeID:             nodeID,
+		AggregateSignature: aggregate,
+	}, nil
 }
 
-func (qc *QC) Valid() bool {
-	if qc == nil {
-		return false
-	}
-	if qc.Genesis {
-		return qc.NodeID == GenesisID && qc.View == 0
-	}
-	if qc.Quorum <= 0 || len(qc.Voters) < qc.Quorum || len(qc.Votes) < qc.Quorum {
-		return false
-	}
-	seen := make(map[string]struct{})
-	for _, vote := range qc.Votes {
-		if vote.Phase != qc.Phase || vote.View != qc.View || vote.NodeID != qc.NodeID || vote.VoterID == "" {
-			return false
-		}
-		seen[vote.VoterID] = struct{}{}
-	}
-	if len(seen) < qc.Quorum {
-		return false
-	}
-	for _, voter := range qc.Voters {
-		if _, ok := seen[voter]; !ok {
-			return false
-		}
-	}
-	return true
+func (qc *QC) Valid(crypto *ReplicaCrypto, quorum int) bool {
+	return crypto != nil && crypto.VerifyQC(qc, quorum)
 }
 
 func (qc *QC) Clone() *QC {
@@ -88,8 +50,6 @@ func (qc *QC) Clone() *QC {
 		return nil
 	}
 	copyQC := *qc
-	copyQC.Voters = append([]string{}, qc.Voters...)
-	copyQC.Votes = append([]Vote{}, qc.Votes...)
 	return &copyQC
 }
 
@@ -100,5 +60,9 @@ func (qc *QC) Short() string {
 	if qc.Genesis {
 		return "genesisQC"
 	}
-	return fmt.Sprintf("%sQC(node=%s view=%d voters=%v)", qc.Phase, qc.NodeID, qc.View, qc.Voters)
+	sig := qc.AggregateSignature
+	if len(sig) > 12 {
+		sig = sig[:12]
+	}
+	return fmt.Sprintf("%sQC(node=%s view=%d aggregate=%s)", qc.Phase, qc.NodeID, qc.View, sig)
 }

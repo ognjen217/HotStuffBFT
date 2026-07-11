@@ -1,203 +1,200 @@
 # Basic HotStuff protocol walkthrough
 
-This document explains the simulator protocol in educational terms. The implementation intentionally follows Basic HotStuff rather than Chained HotStuff so the phases are visible in the trace.
+This document maps the simulator to **Basic HotStuff**. The implementation intentionally keeps the explicit `PREPARE`, `PRECOMMIT`, `COMMIT`, and `DECIDE` phases visible instead of implementing Chained HotStuff.
 
 ## Model
 
-The simulator uses a fixed permissioned replica set. For `f` Byzantine replicas, the system needs at least `n = 3f + 1` total replicas. A quorum certificate needs `n - f = 2f + 1` votes. With the default `n=4`, `f=1`, a QC needs `3` unique voters.
+The replica set is fixed and permissioned. For up to `f` Byzantine replicas, configuration enforces:
 
-Network communication is in-memory, asynchronous, and can be delayed or dropped by scenario rules. This lets the tests model partial synchrony: safety should hold during delay and fault periods, while liveness is expected after the network stabilizes and a correct leader has enough time.
+```text
+n >= 3f + 1
+quorum = n - f
+```
+
+When `n = 3f + 1`, the quorum is `2f + 1`.
+
+The simulator models authenticated reliable point-to-point links. Every replica has a bound endpoint that can authenticate messages only as that replica. Broadcast is expanded into one point-to-point message per recipient. A transient `Drop` decision causes retransmission rather than permanent loss; delay functions model pre-GST and post-GST timing behavior.
+
+## Compact threshold-authenticator model
+
+Every replica has an individual vote-share key inside an in-process threshold oracle. A vote share authenticates:
+
+```text
+<phase, view, nodeID>
+```
+
+The oracle's `Combine` operation checks:
+
+1. every share is valid for its claimed voter;
+2. every voter belongs to the fixed replica set;
+3. voters are unique;
+4. all shares bind the same phase, view, and node;
+5. at least `n-f` valid shares are present.
+
+Only then does it issue one fixed-size aggregate authenticator. A QC stores the tuple and this single aggregate; it does not store all votes.
+
+The oracle is an educational stand-in for a real threshold-signature scheme. It models compact QCs and unforgeability at the protocol boundary, but it is not production BLS/RSA threshold cryptography.
 
 ## Data structures
 
 ### Node
 
-A node wraps one banking command and points to its parent. Its branch is the path from genesis to that node.
+A node contains:
 
-Relevant fields:
+- full SHA-256 ID;
+- parent ID;
+- command;
+- height;
+- proposer;
+- view number;
+- locally derived ancestry.
 
-- `id/hash`
-- `parent id/hash`
-- `command`
-- `height`
-- `proposer/leader`
-- `view number`
+A received node is accepted only when its hash recomputes correctly, its parent exists, its height follows its parent, and its proposer/view match the expected leader/view. Ancestry supplied by a sender is discarded and reconstructed from local parent links.
 
 ### Vote
 
-A vote records:
+A vote contains:
 
-- voter id,
-- phase,
-- view,
-- node id.
+- voter ID;
+- phase;
+- view;
+- node ID;
+- partial authenticator.
 
-Correct replicas do not vote twice for conflicting nodes in the same phase and view.
+Correct replicas do not vote twice for conflicting nodes in the same phase/view. A receiving leader additionally checks that the authenticated message sender equals the vote's claimed voter.
 
 ### QC
 
-A QC is a simulated threshold certificate. It contains the phase, view, node id, voters, and the votes that justify it. A QC is valid when at least quorum unique voters voted for the same phase, same view, and same node.
+A quorum certificate contains:
 
-The simulator does not implement real threshold cryptography. It models the semantics only.
+- phase;
+- view;
+- node ID;
+- one aggregate authenticator.
+
+Validation uses the locally configured quorum. The QC cannot choose its own threshold.
 
 ## Phase-by-phase Basic HotStuff
 
-### 1. New-view
+### 1. NEW_VIEW
 
 When a replica enters view `v`, it sends:
 
 ```text
-NEW_VIEW(view=v, justify=highest prepareQC)
+NEW_VIEW(
+    view = v,
+    justify = highest prepareQC,
+    branch = branch through prepareQC.node
+)
 ```
 
-to `leader(v)`.
+The leader accepts the message only if:
 
-The leader waits for `n-f` new-view messages. From these, it selects `highQC`, the highest-view `prepareQC`. If no previous QC exists, it uses `genesisQC`.
+- the sender is a configured replica;
+- the message authentication tag is valid;
+- the QC aggregate is valid for the configured quorum;
+- the QC is genesis or a `prepareQC` from a lower view;
+- the supplied branch validates and contains the referenced node.
 
-### 2. Prepare
+After `n-f` valid `NEW_VIEW` messages, the leader chooses the highest-view `prepareQC` as `highQC`.
 
-The leader creates a new node extending `highQC.node` and broadcasts:
+### 2. PREPARE
+
+The leader creates a node extending `highQC.node` and broadcasts:
 
 ```text
-PREPARE(node, justify=highQC)
+PREPARE(node, justify = highQC, branch = branch through highQC.node)
 ```
 
-A replica accepts the proposal only if:
+A replica:
 
-1. the node extends `justify.node`, and
-2. `safeNode(node, justifyQC, lockedQC)` is true.
+1. validates/imports the parent branch;
+2. verifies the node hash, parent, height, proposer, and view;
+3. verifies that the node extends `justify.node`;
+4. applies `safeNode`;
+5. enforces one `PREPARE` vote per view;
+6. inserts the node only after all checks pass;
+7. sends an authenticated partial vote to the leader.
 
-Then it sends a `PREPARE` vote to the leader.
-
-### 3. Pre-commit
-
-The leader collects `n-f` `PREPARE` votes and forms:
+The Basic HotStuff voting rule is:
 
 ```text
-prepareQC(node)
+node extends lockedQC.node
+OR
+justifyQC.view > lockedQC.view
 ```
 
-It broadcasts:
+### 3. PRECOMMIT
+
+After `n-f` valid `PREPARE` shares, the leader creates one compact `prepareQC` and broadcasts:
 
 ```text
-PRECOMMIT(justify=prepareQC)
+PRECOMMIT(view = v, justify = prepareQC(view = v), branch)
 ```
 
-Replicas store `prepareQC` and send `PRECOMMIT` votes.
+A replica requires an exact phase and view match. A stale `prepareQC` from another view cannot advance the current view's phase. After validation, the replica stores `PrepareQC` and sends a `PRECOMMIT` vote.
 
-### 4. Commit
+### 4. COMMIT
 
-The leader collects `n-f` `PRECOMMIT` votes and forms:
+After `n-f` valid `PRECOMMIT` shares, the leader creates `precommitQC` and broadcasts:
 
 ```text
-precommitQC(node)
+COMMIT(view = v, justify = precommitQC(view = v), branch)
 ```
 
-It broadcasts:
-
-```text
-COMMIT(justify=precommitQC)
-```
-
-Replicas set:
+A replica validates the exact phase/view, updates:
 
 ```text
 lockedQC = precommitQC
 ```
 
-and send `COMMIT` votes.
+and sends a `COMMIT` vote.
 
-### 5. Decide
+### 5. DECIDE
 
-The leader collects `n-f` `COMMIT` votes and forms:
-
-```text
-commitQC(node)
-```
-
-It broadcasts:
+After `n-f` valid `COMMIT` shares, the leader creates `commitQC` and broadcasts:
 
 ```text
-DECIDE(justify=commitQC)
+DECIDE(view = v, justify = commitQC(view = v), branch)
 ```
 
-Replicas execute every newly decided command on the branch through `commitQC.node`.
+Replicas validate the commit QC and execute all newly decided nodes from the previously executed prefix through `commitQC.node`.
 
-## Banking walkthrough
+## Missing-node handling
 
-Initial state:
+The old behavior of silently replacing an unavailable `highQC.node` with genesis is forbidden. Branches are attached to protocol messages and validated before use. If the highest QC's node remains unavailable, the leader does not propose in that view.
+
+## Pacemaker and partial synchrony
+
+The Pacemaker uses round-robin leaders and exponential timeout backoff:
 
 ```text
-Marko = 1000
-Ana   = 200
-Luka  = 100
+timeout_0 = configured initial timeout
+timeout_(k+1) = min(2 * timeout_k, maximum timeout)
 ```
 
-Commands:
+After a decision, timeout returns to the configured initial value. This models the standard liveness argument: after GST, timeout intervals eventually become long enough for correct replicas to overlap in a view led by a correct leader.
+
+Safety checks never depend on timeout expiration.
+
+## Byzantine tests
+
+The test suite exercises more than simple equivocation:
+
+- a leader fabricates an aggregate QC without shares;
+- a replica attempts sender/voter impersonation;
+- duplicate and mismatched vote shares are combined;
+- a stale phase QC is reused in a later view;
+- a node lies about its ancestry;
+- a node payload is changed after hashing;
+- a leader has a valid high QC whose node is unavailable;
+- the network transiently drops authenticated messages;
+- the Pacemaker timeout doubles and caps correctly.
+
+The safety expectation remains:
 
 ```text
-b128: BLOCK_ACCOUNT(Marko, reason="fraud-check")
-b129: TRANSFER(Marko, Ana, 500)
-b130: APPROVE_LOAN(Ana, loanId="L-42", amount=2000)
+No two correct replicas decide conflicting branches.
 ```
 
-If the replicas decide this order, execution is deterministic:
-
-1. `b128` marks Marko as blocked.
-2. `b129` is decided in the ledger but rejected during execution because Marko is blocked.
-3. `b130` approves Ana's loan.
-
-All correct replicas therefore have the same ledger and the same final banking state.
-
-## Happy path flow
-
-With a correct leader and no network delay:
-
-```text
-NEW_VIEW quorum -> PREPARE proposal -> prepareQC -> precommitQC -> lockedQC -> commitQC -> DECIDE
-```
-
-Each view decides one banking command.
-
-## Byzantine equivocation flow
-
-A Byzantine leader can send conflicting proposals in the same view:
-
-```text
-B2 receives BLOCK_ACCOUNT(Marko)
-B3 receives BLOCK_ACCOUNT(Marko), then conflicting TRANSFER(Marko,Luka)
-B4 receives TRANSFER(Marko,Luka)
-```
-
-A correct replica that already voted `PREPARE` in that view rejects the later conflicting proposal. Because a valid QC needs `2f+1` votes and there are only `f` Byzantine replicas, two conflicting QCs cannot both be formed from correct voting behavior.
-
-The scenario trace makes this visible with lines such as:
-
-```text
-[B3] safeNode rejected ... reason=already voted conflicting PREPARE
-```
-
-## Safety intuition
-
-Safety comes from quorum intersection and locking.
-
-Any two quorums of size `2f+1` in a system of `3f+1` replicas intersect in at least `f+1` replicas. Since at most `f` are Byzantine, the intersection contains at least one correct replica. A correct replica does not vote twice for conflicting nodes in the same phase and view, and once locked, it only votes for a conflicting branch if the proposal carries a higher-view QC. This prevents two conflicting branches from both being decided by correct replicas.
-
-## Liveness intuition
-
-The simple pacemaker uses view timeouts and round-robin leaders. If a leader is silent or the network is too slow, replicas timeout and enter the next view. After a GST-like stabilization period, messages arrive before timeout and eventually a correct leader collects enough `NEW_VIEW` messages, proposes a safe node, and drives the phase sequence to `DECIDE`.
-
-## Limitations
-
-This is a teaching simulator. It deliberately omits:
-
-- real signatures and threshold cryptography,
-- persistent storage,
-- recovery after crashes,
-- real client networking,
-- batching and mempool logic,
-- Chained HotStuff pipelining,
-- production-grade pacemaker logic,
-- performance engineering.
-
-The goal is readable protocol behavior and tests, not deployment readiness.
+The liveness expectation is conditional on eventual network stability and a correct leader remaining active long enough.

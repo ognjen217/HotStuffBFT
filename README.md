@@ -2,7 +2,7 @@
 
 Educational Go simulator for **Basic HotStuff BFT consensus** using a concrete permissioned banking-network case study.
 
-This is not a production blockchain. It is a clear, testable simulator for learning how replicas use views, leaders, QCs, locks, and the Basic HotStuff phases to agree on a deterministic ledger order even when one replica is faulty.
+This is not a production blockchain. It is a clear, testable simulator for learning how replicas use views, leaders, compact quorum certificates, locks, authenticated links, and the Basic HotStuff phases to agree on a deterministic ledger order even when one replica is faulty.
 
 ## Banking case study
 
@@ -28,7 +28,7 @@ b129: TRANSFER(Marko, Ana, 500)
 b130: APPROVE_LOAN(Ana, loanId="L-42", amount=2000)
 ```
 
-The important behavior is deterministic execution after consensus. If `b128` is decided before `b129`, then Marko is already blocked, so the transfer is included in the decided ledger but is marked invalid/rejected by every correct replica. Consensus agrees on the order; the state machine deterministically decides whether each command is valid.
+Consensus agrees on command order. The deterministic banking state machine then determines whether a decided command is valid. If `b128` is decided before `b129`, every correct replica includes the transfer in the decided ledger but rejects it during execution because Marko is already blocked.
 
 ## Run
 
@@ -36,6 +36,7 @@ The important behavior is deterministic execution after consensus. If `b128` is 
 go run ./cmd/hotstuff-sim --scenario happy
 go run ./cmd/hotstuff-sim --scenario silent-leader
 go run ./cmd/hotstuff-sim --scenario byzantine-equivocation
+go run ./cmd/hotstuff-sim --scenario byzantine-forged-qc
 go run ./cmd/hotstuff-sim --scenario banking-block-transfer
 go run ./cmd/hotstuff-sim --scenario delayed-network
 ```
@@ -53,68 +54,67 @@ Optional flags:
 --visualize=true
 ```
 
-By default, each run now saves the terminal output to `logs/<scenario>.txt` and calls the Python visualizer to create `visualizations/<scenario>.html`:
-
-```bash
-go run ./cmd/hotstuff-sim --scenario byzantine-equivocation --timeout-ms 1000
-xdg-open visualizations/byzantine-equivocation.html
-```
-
-You can also call the visualizer manually:
-
-```bash
-python3 scripts/visualize_log.py --log logs/happy.txt --out visualizations/happy.html
-```
-
-See `docs/VISUALIZATION.md` for details.
+`--timeout-ms` is the **initial** view timeout. The Pacemaker doubles it after each unsuccessful view, up to a bounded cap, and resets it after a decision.
 
 Run tests:
 
 ```bash
 go test ./...
+go test -race ./...
+go vet ./...
 ```
 
-## Basic HotStuff model used here
+## Basic HotStuff model
 
 The simulator uses the standard BFT resilience model:
 
-- `n = 3f + 1` replicas
-- up to `f` Byzantine replicas
-- quorum size `n - f = 2f + 1`
-- default: `n=4`, `f=1`, quorum `3`
-- leader-based views with round-robin leader selection
-- partial synchrony simulated with message delays and timeouts
+- fixed permissioned replica set;
+- `n >= 3f + 1` replicas;
+- up to `f` Byzantine replicas;
+- quorum size `n - f` (`2f + 1` when `n = 3f + 1`);
+- round-robin leaders;
+- partial synchrony represented by delays, timeouts, and eventual stabilization;
+- safety checks remain active during delay/fault periods;
+- liveness is expected after the network stabilizes and a correct leader remains active long enough.
 
-Each view has one leader. Replicas move to a later view on decision or timeout. The next leader collects `NEW_VIEW` messages, selects the highest known `prepareQC`, and proposes a node extending that QC's node.
+Each view has one leader. Replicas move to a later view on decision or timeout. The next leader collects `NEW_VIEW` messages, selects the highest valid `prepareQC`, obtains the corresponding branch, and proposes a node extending that QC's node.
 
 ## Explicit Basic HotStuff phases
 
-The code models the five requested phases directly:
+1. `NEW_VIEW`: replicas send their highest known `prepareQC` and the branch needed to validate it.
+2. `PREPARE`: the leader proposes a new node extending `highQC.node`; replicas validate the node and apply `safeNode`.
+3. `PRECOMMIT`: the leader forms a compact `prepareQC`; replicas store it and vote.
+4. `COMMIT`: the leader forms a compact `precommitQC`; replicas set `lockedQC = precommitQC` and vote.
+5. `DECIDE`: the leader forms a compact `commitQC`; replicas execute newly decided commands through the decided node.
 
-1. `NEW_VIEW`: replicas send their highest known `prepareQC` to the next leader.
-2. `PREPARE`: leader proposes a new node extending `highQC.node`; replicas check `safeNode` and vote.
-3. `PRECOMMIT`: leader forms `prepareQC`; replicas store it and vote.
-4. `COMMIT`: leader forms `precommitQC`; replicas set `lockedQC = precommitQC` and vote.
-5. `DECIDE`: leader forms `commitQC`; replicas execute newly decided commands through the decided node.
+## Compact quorum certificates
 
-## Quorum certificates
+Votes contain replica-bound partial authenticators. A QC contains one fixed-size aggregate authenticator over:
 
-A `QC` is simulated by collecting unique voter IDs. A QC is valid only if:
+```text
+<phase, view, nodeID>
+```
 
-- it has at least quorum unique voters,
-- every vote has the same phase,
-- every vote has the same view,
-- every vote has the same node ID.
+The in-process threshold oracle releases an aggregate only after receiving at least `n-f` unique, valid vote shares for exactly the same tuple. Individual vote shares are **not embedded in the QC**, so the simulator models the paper's linear authenticator complexity: one leader broadcast plus one partial authenticator from each replica per phase.
 
-**This simulator models QC semantics but does not implement production cryptography.** There are no real threshold signatures, no real private keys, and no network authentication layer.
+This is a semantic simulator of threshold cryptography, not a production BLS/RSA threshold-signature implementation. The oracle intentionally centralizes key material inside the simulator process so that the protocol can model unforgeability and compact QCs without external dependencies.
 
-## `lockedQC`
+## Authenticated reliable point-to-point network
 
-A replica updates `lockedQC` during the `COMMIT` phase when it receives a valid `precommitQC`. The lock prevents the replica from later voting for a conflicting branch unless a later-view QC justifies the proposal. This is the core safety mechanism that stops two conflicting branches from both being decided by correct replicas.
+Every replica receives a sender-bound transport endpoint:
 
-## `safeNode`
+- an endpoint can authenticate messages only as its own replica ID;
+- a message claiming another sender is rejected before delivery;
+- all protocol fields are covered by the authentication tag;
+- broadcast is implemented as one authenticated point-to-point send per replica, including the sender;
+- transient drops are retried until delivery or simulator shutdown;
+- delayed/stale messages may still arrive, but view/phase checks reject messages that are no longer applicable.
 
-`SafeNode(node, justifyQC, lockedQC)` returns true if either:
+This models authenticated reliable communication between correct replicas. It is still an in-memory simulator, not TCP/TLS networking.
+
+## `safeNode`, locking, and node validation
+
+`SafeNode(node, justifyQC, lockedQC)` returns true when either:
 
 ```text
 node extends lockedQC.node
@@ -122,48 +122,69 @@ OR
 justifyQC.view > lockedQC.view
 ```
 
-Genesis or empty locks are treated as safe. The function is implemented separately in `internal/hotstuff/safenode.go` and tested directly.
+Before this rule is evaluated, the proposal is validated against the local tree:
 
-## Scenarios
+- full SHA-256 node ID is recomputed;
+- parent must exist;
+- height must equal `parent.height + 1`;
+- proposer and view must match the current leader/view;
+- ancestry is reconstructed from local parent links;
+- transmitted `Ancestors` data is never trusted.
 
-### `happy`
+A received node is inserted only after all validation and HotStuff safety checks pass.
 
-All replicas are correct. The banking commands are proposed and decided in order. All correct replicas finish with the same ledger and same banking state.
+## Branch synchronization
 
-### `silent-leader`
+`NEW_VIEW` and phase-transition messages carry the relevant validated branch. A leader no longer falls back to genesis when `highQC.node` is missing. It imports and validates the supplied branch; if the referenced node is still unavailable, it does not propose in that view.
 
-The first leader receives `NEW_VIEW` messages but sends no proposal. Replicas timeout, move to the next view, and the next leader continues normally using the highest known QC.
+## Pacemaker
+
+The educational Pacemaker uses:
+
+- deterministic round-robin leader selection;
+- one timer per view;
+- exponential timeout backoff after unsuccessful views;
+- a maximum timeout cap;
+- timeout reset after a valid decision.
+
+This is sufficient to model the paper's standard eventual-overlap liveness argument more faithfully than a fixed timeout.
+
+## Adversarial scenarios
 
 ### `byzantine-equivocation`
 
-Replica `B1` is a Byzantine leader in view 1. It sends conflicting `PREPARE` proposals:
+A Byzantine leader sends conflicting `PREPARE` proposals to different replicas. Correct replicas enforce one vote per phase/view, so the conflicting proposals cannot both obtain a QC.
 
-- primary: `b128: BLOCK_ACCOUNT(Marko)`
-- conflict: `b128-prime: TRANSFER(Marko, Luka, 500)`
+### `byzantine-forged-qc`
 
-Correct replicas obey the one-vote-per-phase-per-view rule, so a conflicting proposal cannot collect a valid QC from correct replicas. The trace shows accepted and rejected votes, then a timeout/view-change recovery.
+A Byzantine leader broadcasts a fabricated compact `prepareQC` without quorum vote shares. Correct replicas reject it, timeout, move to a later view, and decide under a correct leader.
 
-### `banking-block-transfer`
+Additional tests cover:
 
-The default banking example is emphasized: Marko is blocked first, and the later transfer from Marko is deterministically rejected by all correct replicas.
+- forged aggregate QCs;
+- duplicate and mismatched votes;
+- vote signer/tuple binding;
+- sender spoofing at the transport layer;
+- stale phase QCs;
+- forged ancestry and node tampering;
+- missing `highQC.node` without genesis fallback;
+- transient network drops and retry;
+- exponential Pacemaker backoff.
 
-### `delayed-network`
+## Remaining limitations
 
-Early messages are delayed beyond the timeout to mimic a pre-GST period. After the network stabilizes, a correct leader decides.
-
-## What is simplified compared to production HotStuff
-
-- No real threshold signatures or cryptographic authentication.
+- The threshold-signature oracle is educational, not production cryptography.
 - No persistent storage or crash recovery.
-- No TCP, TLS, peer discovery, mempool, batching, or client request deduplication.
-- No Chained HotStuff pipelining; this is Basic HotStuff with explicit phases.
-- No production pacemaker; timeouts are simple educational timers.
-- Faults are scenario-driven and deterministic so the trace is readable and tests are stable.
+- No real TCP/TLS peer networking, peer discovery, mempool, batching, or client request deduplication.
+- No Chained HotStuff pipelining; this repository intentionally exposes Basic HotStuff phases.
+- No production-grade clock synchronization or distributed Pacemaker service.
+- Faults remain scenario-driven so traces and tests are deterministic.
 
 ## Repository structure
 
 ```text
 cmd/hotstuff-sim/main.go
+internal/hotstuff/crypto.go
 internal/hotstuff/node.go
 internal/hotstuff/message.go
 internal/hotstuff/qc.go
@@ -174,11 +195,6 @@ internal/banking/command.go
 internal/banking/state.go
 internal/network/network.go
 internal/scenario/scenario.go
-internal/scenario/happy.go
-internal/scenario/silent_leader.go
-internal/scenario/byzantine_equivocation.go
-internal/scenario/banking_block_transfer.go
-internal/scenario/delayed_network.go
+internal/scenario/byzantine_forged_qc.go
 docs/PROTOCOL.md
-README.md
 ```

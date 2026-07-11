@@ -75,6 +75,8 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		return runSilentLeader(ctx, cfg)
 	case "byzantine-equivocation":
 		return runByzantineEquivocation(ctx, cfg)
+	case "byzantine-forged-qc":
+		return runByzantineForgedQC(ctx, cfg)
 	case "banking-block-transfer":
 		return runBankingBlockTransfer(ctx, cfg)
 	case "delayed-network":
@@ -93,31 +95,43 @@ type clusterOptions struct {
 	verboseNet bool
 }
 
-func buildCluster(ctx context.Context, cfg Config, opts clusterOptions) (*Result, context.CancelFunc, error) {
+func buildCluster(parent context.Context, cfg Config, opts clusterOptions) (*Result, context.CancelFunc, error) {
 	hsCfg, err := hotstuff.NewConfig(cfg.N, cfg.F)
 	if err != nil {
 		return nil, nil, err
 	}
+	ctx, cancel := context.WithCancel(parent)
 	trace := &Trace{Verbose: cfg.Verbose}
-	net := network.New(trace)
+	oracle := hotstuff.NewSimulatedThresholdOracle(hsCfg.ReplicaIDs, fmt.Sprintf("seed-%d", cfg.Seed))
+	verifier, err := oracle.ForReplica(hsCfg.ReplicaIDs[0])
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	net := network.New(ctx, trace, verifier)
 	net.Verbose = cfg.Verbose || opts.verboseNet
 	net.Delay = opts.delay
 	net.Drop = opts.drop
 	net.Rand = rand.New(rand.NewSource(cfg.Seed))
 	commandSource := hotstuff.NewSliceCommandSource(opts.commands)
 
-	ctx, cancel := context.WithCancel(ctx)
 	replicas := make([]*hotstuff.Replica, 0, cfg.N)
 	for _, id := range hsCfg.ReplicaIDs {
-		inbox := net.Register(id, 256)
-		r := hotstuff.NewReplica(id, hsCfg, inbox, net, commandSource, banking.DefaultState(), cfg.Timeout, trace)
-		if fault, ok := opts.faults[id]; ok {
-			r.Faults = fault
+		crypto, cryptoErr := oracle.ForReplica(id)
+		if cryptoErr != nil {
+			cancel()
+			return nil, nil, cryptoErr
 		}
-		replicas = append(replicas, r)
+		inbox := net.Register(id, 256)
+		transport := net.Endpoint(id, crypto)
+		replica := hotstuff.NewReplica(id, hsCfg, inbox, transport, commandSource, banking.DefaultState(), cfg.Timeout, trace, crypto)
+		if fault, ok := opts.faults[id]; ok {
+			replica.Faults = fault
+		}
+		replicas = append(replicas, replica)
 	}
-	for _, r := range replicas {
-		go r.Start(ctx)
+	for _, replica := range replicas {
+		go replica.Start(ctx)
 	}
 	faulty := opts.faultyIDs
 	if faulty == nil {
@@ -140,11 +154,11 @@ func waitForCorrectDecisions(ctx context.Context, replicas []*hotstuff.Replica, 
 			return fmt.Errorf("timed out waiting for %d decisions", decisions)
 		case <-tick.C:
 			all := true
-			for _, r := range replicas {
-				if !contains(correctIDs, r.ID) {
+			for _, replica := range replicas {
+				if !contains(correctIDs, replica.ID) {
 					continue
 				}
-				if r.ExecutedCount() < decisions {
+				if replica.ExecutedCount() < decisions {
 					all = false
 					break
 				}
@@ -187,8 +201,8 @@ func (r *Result) Summary() string {
 }
 
 func contains(values []string, target string) bool {
-	for _, v := range values {
-		if v == target {
+	for _, value := range values {
+		if value == target {
 			return true
 		}
 	}
@@ -196,10 +210,10 @@ func contains(values []string, target string) bool {
 }
 
 func defaultCommands() []hotstuff.Command {
-	cmds := banking.DefaultCommands()
-	out := make([]hotstuff.Command, len(cmds))
-	for i := range cmds {
-		out[i] = cmds[i]
+	commands := banking.DefaultCommands()
+	out := make([]hotstuff.Command, len(commands))
+	for i := range commands {
+		out[i] = commands[i]
 	}
 	return out
 }
@@ -209,8 +223,8 @@ func delayedBeforeGST(timeout time.Duration, seed int64) network.DelayFunc {
 	rng := rand.New(rand.NewSource(seed))
 	var mu sync.Mutex
 	return func(msg hotstuff.Message) time.Duration {
-		c := count.Add(1)
-		if c <= 18 {
+		current := count.Add(1)
+		if current <= 18 {
 			return timeout + 40*time.Millisecond
 		}
 		mu.Lock()

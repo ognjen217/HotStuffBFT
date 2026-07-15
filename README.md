@@ -1,184 +1,378 @@
-# HotStuffBFT
+# Basic HotStuff BFT Simulator
 
-Educational Go simulator for **Basic HotStuff BFT consensus** using a concrete permissioned banking-network case study.
+A small educational simulator of the **Basic HotStuff** Byzantine Fault Tolerant consensus protocol described in Algorithm 2 of the HotStuff paper.
 
-This is not a production blockchain. It is a clear, testable simulator for learning how replicas use views, leaders, QCs, locks, and the Basic HotStuff phases to agree on a deterministic ledger order even when one replica is faulty.
+The project runs four replicas, simulates authenticated point-to-point communication, executes banking commands through a replicated state machine, and displays the protocol as a live Mermaid sequence diagram alongside textual logs.
 
-## Banking case study
+> This project implements the non-pipelined **Basic HotStuff** flow: `NEW-VIEW -> PREPARE -> PRE-COMMIT -> COMMIT -> DECIDE`. It is not an implementation of Chained HotStuff and it is not intended for production deployment.
 
-The replicated service is a small banking ledger. Replicas are banks/regulators that must agree on the order of critical commands:
+## What the project demonstrates
 
-- `TRANSFER(from, to, amount)`
-- `BLOCK_ACCOUNT(accountId, reason)`
-- `APPROVE_LOAN(accountId, loanId, amount)`
+- a fixed cluster with `n = 4` replicas and tolerance of `f = 1` Byzantine fault;
+- deterministic round-robin leader selection;
+- quorum size `n - f = 2f + 1 = 3`;
+- collection of `NEW-VIEW` messages and selection of the highest `prepareQC`;
+- the HotStuff safety predicate based on ancestry and `lockedQC`;
+- one vote per replica, phase, and view;
+- formation and verification of quorum certificates;
+- locking during the commit phase;
+- execution of the committed branch in identical order on every correct replica;
+- timeout-driven view changes with exponential backoff;
+- live protocol visualization in the browser.
 
-Default initial accounts:
+## Project structure
 
 ```text
-Marko: 1000
-Ana:   200
-Luka:  100
+.
+├── assets/
+│   └── mermaid.min.js       Local Mermaid library used by the browser
+├── crypto.go                Signature shares and idealized threshold-QC verification
+├── domain.go                Shared protocol, command, node, QC, and message types
+├── go.mod                   Go module definition
+├── index.html               Minimal web interface and live sequence diagram
+├── logger.go                Thread-safe simulation log storage
+├── main.go                  Cluster creation, HTTP server, and scenario orchestration
+├── network.go               Simulated authenticated network and shared node retrieval
+├── node.go                  Core Basic HotStuff replica and leader logic
+├── pacemaker.go             View timeout and exponential-backoff logic
+├── state_machine.go         Replicated banking application state machine
+├── visualization.go         Read-only state and event model for the web interface
+├── visualization_test.go    Visualization-state consistency test
+└── CODE_RUNDOWN.md          Detailed explanation of every project file
 ```
 
-Default commands:
+A more detailed file-by-file explanation is available in [`CODE_RUNDOWN.md`](CODE_RUNDOWN.md).
+
+## Requirements
+
+- Go 1.23 or newer;
+- a modern web browser;
+- no external JavaScript installation and no internet connection are required for Mermaid.
+
+Check the installed Go version:
+
+```bash
+go version
+```
+
+## Running the web interface
+
+From the project directory:
+
+```bash
+go run .
+```
+
+Open the following address in a browser:
 
 ```text
-b128: BLOCK_ACCOUNT(Marko, reason="fraud-check")
-b129: TRANSFER(Marko, Ana, 500)
-b130: APPROVE_LOAN(Ana, loanId="L-42", amount=2000)
+http://localhost:8081
 ```
 
-The important behavior is deterministic execution after consensus. If `b128` is decided before `b129`, then Marko is already blocked, so the transfer is included in the decided ledger but is marked invalid/rejected by every correct replica. Consensus agrees on the order; the state machine deterministically decides whether each command is valid.
+The page contains:
 
-## Run
+1. buttons for selecting a simulation scenario;
+2. a live Mermaid message sequence diagram;
+3. the complete textual protocol log.
+
+Only one scenario is executed at a time. The browser polls the server every 350 ms and updates both the sequence diagram and log output.
+
+## Running a scenario from the command line
+
+The same scenarios can be executed without the browser:
 
 ```bash
-go run ./cmd/hotstuff-sim --scenario happy
-go run ./cmd/hotstuff-sim --scenario silent-leader
-go run ./cmd/hotstuff-sim --scenario byzantine-equivocation
-go run ./cmd/hotstuff-sim --scenario banking-block-transfer
-go run ./cmd/hotstuff-sim --scenario delayed-network
+go run . -scenario happy
+go run . -scenario silent-leader
+go run . -scenario byzantine-equivocation
+go run . -scenario banking-block-transfer
+go run . -scenario delayed-network
 ```
 
-Optional flags:
+To disable the web server without selecting a CLI scenario:
 
 ```bash
---n 4
---f 1
---timeout-ms 150
---seed 1
---verbose
---log-dir logs
---viz-dir visualizations
---visualize=true
+go run . -web=false
 ```
 
-By default, each run now saves the terminal output to `logs/<scenario>.txt` and calls the Python visualizer to create `visualizations/<scenario>.html`:
+## Available scenarios
 
-```bash
-go run ./cmd/hotstuff-sim --scenario byzantine-equivocation --timeout-ms 1000
-xdg-open visualizations/byzantine-equivocation.html
+### Happy Path
+
+Runs the normal protocol with four responsive replicas. Three banking commands are submitted one at a time and every replica commits and executes the same ordered log.
+
+### Banking Commands
+
+Uses the same three-command sequence as the happy-path scenario to emphasize replicated state-machine behavior:
+
+1. block Marko's account;
+2. attempt a transfer from the blocked account;
+3. approve a loan for Ana.
+
+The consensus protocol orders commands; the banking state machine independently determines whether each ordered command is valid.
+
+### Silent Leader
+
+Crashes `Node-1`, which is the leader of view 1. The remaining replicas time out, enter a later view, send `NEW-VIEW` messages to the next leader, and commit the pending command once a correct leader has a sufficiently long view.
+
+### Byzantine Equivocation
+
+The first leader sends conflicting proposals to different replicas and withholds its own vote. Correct replicas obey the one-vote-per-phase-and-view rule, so two conflicting quorum certificates cannot be formed. After the faulty leader is removed, a later correct leader commits a safe recovery command.
+
+### Delayed Network
+
+Introduces random delays of up to three seconds. The pacemaker may trigger several view changes, and its timeout grows exponentially until the system obtains a sufficiently long stable view.
+
+## End-to-end execution flow
+
+The following sequence explains what happens from the moment a user starts a scenario until a command is executed.
+
+### 1. Scenario selection
+
+The browser calls:
+
+```text
+GET /run?scenario=<scenario-name>
 ```
 
-You can also call the visualizer manually:
+`main.go` creates a fresh cluster, clears previous logs, registers the active visualization state, and starts four replicas.
 
-```bash
-python3 scripts/visualize_log.py --log logs/happy.txt --out visualizations/happy.html
+### 2. Cluster initialization
+
+`NewCluster`:
+
+1. defines `Node-1` through `Node-4`;
+2. calculates `f = 1` and quorum `3`;
+3. creates an Ed25519 key pair for each replica;
+4. creates the simulated network;
+5. constructs and starts every node and its pacemaker.
+
+Each replica begins in view 1 and sends a `NEW-VIEW` message to the deterministic leader of that view.
+
+### 3. Client command distribution
+
+The scenario sends a banking `Command` to every non-crashed replica through `BroadcastClientCommand`.
+
+Each replica stores the command in its local pending queue. Only the current leader can turn a pending command into a proposal.
+
+### 4. NEW-VIEW and leader proposal
+
+The leader waits until it has `n - f` unique `NEW-VIEW` messages. It selects the highest valid `prepareQC` carried by those messages as `highQC`.
+
+The leader then:
+
+1. chooses the next pending command;
+2. creates a new `TreeNode` whose parent is `highQC.node`, or `GENESIS` when no QC exists;
+3. hashes the complete parent-and-command representation;
+4. broadcasts a `PREPARE` proposal.
+
+### 5. PREPARE
+
+A replica accepts the proposal only when:
+
+- it came from the leader of the current view;
+- the node hash is correct;
+- the proposal extends the node justified by the attached QC;
+- the QC is valid;
+- the HotStuff `safeNode` predicate is satisfied.
+
+The `safeNode` predicate accepts a proposal when either:
+
+- the proposal extends the replica's locked branch; or
+- the justification QC has a higher view than the replica's current lock.
+
+An accepting replica signs the tuple:
+
+```text
+<PREPARE, viewNumber, nodeHash>
 ```
 
-See `docs/VISUALIZATION.md` for details.
+and sends one vote to the leader.
 
-Run tests:
+### 6. PRE-COMMIT
+
+After collecting three valid and unique prepare votes for the same node and view, the leader combines them into a `prepareQC` and broadcasts `PRE-COMMIT`.
+
+Replicas verify the QC, remember it as their highest `PrepareQC`, and send a pre-commit vote.
+
+### 7. COMMIT and locking
+
+After collecting a quorum of pre-commit votes, the leader forms a `precommitQC` and broadcasts `COMMIT`.
+
+Each accepting replica updates:
+
+```text
+LockedQC = precommitQC
+```
+
+and sends a commit vote. This lock is the central safety mechanism that prevents conflicting committed branches.
+
+### 8. DECIDE and state-machine execution
+
+After collecting a quorum of commit votes, the leader creates a `commitQC` and broadcasts `DECIDE`.
+
+Every replica:
+
+1. verifies the `commitQC`;
+2. reconstructs the branch from its last executed node to the committed node;
+3. executes all previously unexecuted commands in parent-to-child order;
+4. records the commands as executed;
+5. advances to the next view.
+
+### 9. View change and pacemaker
+
+If a replica does not decide before its timer expires, the pacemaker issues a `nextView` interrupt. The replica advances its view and sends its highest `PrepareQC` to the next leader.
+
+The timeout doubles after unsuccessful views and is reset to the base timeout after a successful decision.
+
+### 10. Browser updates
+
+The browser repeatedly requests:
+
+```text
+GET /visual-state
+GET /logs
+```
+
+`visualization.go` converts snapshots of the cluster and recorded transport events into JSON. `index.html` converts recent events into Mermaid sequence-diagram syntax and renders the resulting SVG.
+
+## HTTP endpoints
+
+| Endpoint                     | Purpose                                                    |
+| ---------------------------- | ---------------------------------------------------------- |
+| `GET /`                      | Serves the web interface                                   |
+| `GET /assets/mermaid.min.js` | Serves the local Mermaid bundle                            |
+| `GET /run?scenario=<name>`   | Starts a scenario and returns HTTP 202                     |
+| `GET /logs`                  | Returns the current log as a JSON array of strings         |
+| `GET /visual-state`          | Returns a read-only JSON snapshot used by the live diagram |
+
+## Replicated banking state machine
+
+The consensus layer orders commands; `state_machine.go` applies them deterministically.
+
+Supported command types:
+
+| Command         | Effect                                                                |
+| --------------- | --------------------------------------------------------------------- |
+| `TRANSFER`      | Moves funds when the sender is not blocked and has sufficient balance |
+| `BLOCK_ACCOUNT` | Marks an account as blocked                                           |
+| `APPROVE_LOAN`  | Records a loan and credits the specified account                      |
+
+Initial balances:
+
+| Account | Balance |
+| ------- | ------: |
+| Marko   |    1000 |
+| Ana     |     200 |
+| Luka    |     100 |
+
+A command can be committed by consensus but rejected by the application state machine. For example, a transfer from a blocked account is still part of the ordered log, but applying it produces no balance change. Every correct replica reaches the same result because execution is deterministic.
+
+## Cryptographic model
+
+The paper assumes a threshold-signature primitive with operations equivalent to `tsign`, `tcombine`, and `tverify`.
+
+This simulator models that interface as follows:
+
+- every replica owns a real Ed25519 key pair;
+- votes are real Ed25519 signatures over `<phase, view, nodeHash>`;
+- the verifier checks all shares before forming a QC;
+- a QC carries one opaque combined token;
+- the verified shares behind that token are retained in the simulator's in-memory verifier.
+
+This preserves the protocol behavior required for the simulation, including identity, message binding, uniqueness, and QC validation. It is **not** a distributed production threshold-signature implementation such as BLS threshold signatures.
+
+## Safety-related checks implemented by the simulator
+
+- the transport stamps the sender identity instead of trusting a message-provided ID;
+- unknown replica identities are rejected;
+- stale messages are ignored and future-view messages are buffered;
+- only the deterministic leader may send phase-control messages;
+- a replica votes at most once per phase and view;
+- vote sets are indexed by phase, view, and node hash;
+- signature shares from different tuples cannot be combined;
+- a QC must match the expected phase, view, and node;
+- a proposal must extend its justification node;
+- a `DECIDE` message without a valid `commitQC` cannot execute a command;
+- node hashes cover the complete command, including transfer recipient;
+- committed commands are executed at most once.
+
+## Tests and static analysis
+
+Run the normal test suite:
 
 ```bash
 go test ./...
 ```
 
-## Basic HotStuff model used here
+Run tests with Go's race detector:
 
-The simulator uses the standard BFT resilience model:
-
-- `n = 3f + 1` replicas
-- up to `f` Byzantine replicas
-- quorum size `n - f = 2f + 1`
-- default: `n=4`, `f=1`, quorum `3`
-- leader-based views with round-robin leader selection
-- partial synchrony simulated with message delays and timeouts
-
-Each view has one leader. Replicas move to a later view on decision or timeout. The next leader collects `NEW_VIEW` messages, selects the highest known `prepareQC`, and proposes a node extending that QC's node.
-
-## Explicit Basic HotStuff phases
-
-The code models the five requested phases directly:
-
-1. `NEW_VIEW`: replicas send their highest known `prepareQC` to the next leader.
-2. `PREPARE`: leader proposes a new node extending `highQC.node`; replicas check `safeNode` and vote.
-3. `PRECOMMIT`: leader forms `prepareQC`; replicas store it and vote.
-4. `COMMIT`: leader forms `precommitQC`; replicas set `lockedQC = precommitQC` and vote.
-5. `DECIDE`: leader forms `commitQC`; replicas execute newly decided commands through the decided node.
-
-## Quorum certificates
-
-A `QC` is simulated by collecting unique voter IDs. A QC is valid only if:
-
-- it has at least quorum unique voters,
-- every vote has the same phase,
-- every vote has the same view,
-- every vote has the same node ID.
-
-**This simulator models QC semantics but does not implement production cryptography.** There are no real threshold signatures, no real private keys, and no network authentication layer.
-
-## `lockedQC`
-
-A replica updates `lockedQC` during the `COMMIT` phase when it receives a valid `precommitQC`. The lock prevents the replica from later voting for a conflicting branch unless a later-view QC justifies the proposal. This is the core safety mechanism that stops two conflicting branches from both being decided by correct replicas.
-
-## `safeNode`
-
-`SafeNode(node, justifyQC, lockedQC)` returns true if either:
-
-```text
-node extends lockedQC.node
-OR
-justifyQC.view > lockedQC.view
+```bash
+go test -race ./...
 ```
 
-Genesis or empty locks are treated as safe. The function is implemented separately in `internal/hotstuff/safenode.go` and tested directly.
+Run static analysis:
 
-## Scenarios
-
-### `happy`
-
-All replicas are correct. The banking commands are proposed and decided in order. All correct replicas finish with the same ledger and same banking state.
-
-### `silent-leader`
-
-The first leader receives `NEW_VIEW` messages but sends no proposal. Replicas timeout, move to the next view, and the next leader continues normally using the highest known QC.
-
-### `byzantine-equivocation`
-
-Replica `B1` is a Byzantine leader in view 1. It sends conflicting `PREPARE` proposals:
-
-- primary: `b128: BLOCK_ACCOUNT(Marko)`
-- conflict: `b128-prime: TRANSFER(Marko, Luka, 500)`
-
-Correct replicas obey the one-vote-per-phase-per-view rule, so a conflicting proposal cannot collect a valid QC from correct replicas. The trace shows accepted and rejected votes, then a timeout/view-change recovery.
-
-### `banking-block-transfer`
-
-The default banking example is emphasized: Marko is blocked first, and the later transfer from Marko is deterministically rejected by all correct replicas.
-
-### `delayed-network`
-
-Early messages are delayed beyond the timeout to mimic a pre-GST period. After the network stabilizes, a correct leader decides.
-
-## What is simplified compared to production HotStuff
-
-- No real threshold signatures or cryptographic authentication.
-- No persistent storage or crash recovery.
-- No TCP, TLS, peer discovery, mempool, batching, or client request deduplication.
-- No Chained HotStuff pipelining; this is Basic HotStuff with explicit phases.
-- No production pacemaker; timeouts are simple educational timers.
-- Faults are scenario-driven and deterministic so the trace is readable and tests are stable.
-
-## Repository structure
-
-```text
-cmd/hotstuff-sim/main.go
-internal/hotstuff/node.go
-internal/hotstuff/message.go
-internal/hotstuff/qc.go
-internal/hotstuff/replica.go
-internal/hotstuff/protocol.go
-internal/hotstuff/safenode.go
-internal/banking/command.go
-internal/banking/state.go
-internal/network/network.go
-internal/scenario/scenario.go
-internal/scenario/happy.go
-internal/scenario/silent_leader.go
-internal/scenario/byzantine_equivocation.go
-internal/scenario/banking_block_transfer.go
-internal/scenario/delayed_network.go
-docs/PROTOCOL.md
-README.md
+```bash
+go vet ./...
 ```
+
+The tests cover:
+
+- complete command hashing;
+- rejection of signature shares from mixed views;
+- one vote per phase and view;
+- rejection of forged `DECIDE` messages;
+- identical happy-path execution on all four replicas;
+- JSON-serializable and protocol-consistent visualization state.
+
+## How to extend the project
+
+### Add a new banking command
+
+1. Add a new value to `CommandType` in `domain.go`.
+2. Add its validation and deterministic behavior to `StateMachine.Execute`.
+3. Create commands of that type in a scenario in `main.go`.
+4. Add unit tests for valid, invalid, and repeated execution cases.
+
+### Add a new simulation scenario
+
+1. Add a new scenario function in `main.go`.
+2. Add the scenario name to the `runSimulation` switch.
+3. Add a matching button in `index.html`.
+4. Use `Network.Send`, `BroadcastClientCommand`, `CrashNode`, or configurable delays to model the behavior.
+5. Add a test when the scenario introduces new protocol behavior.
+
+### Change cluster size
+
+The current scenarios and UI assume four replicas. To experiment with another valid HotStuff cluster size:
+
+1. change the `nodeIDs` list in `NewCluster`;
+2. preserve `n >= 3f + 1`;
+3. ensure the intended fault count and quorum are still calculated correctly;
+4. update scenarios that refer to specific node IDs.
+
+## Important limitations
+
+- This is an in-process simulator; replicas are goroutines, not separate machines.
+- The shared `NodeStore` simplifies retrieval of missing ancestors.
+- The threshold certificate implementation is idealized and in-memory.
+- Network authentication is modeled by the trusted simulated transport.
+- Client reply collection, request numbering, persistence, recovery, storage durability, and production networking are outside the scope of the project.
+- The visual endpoint exposes more information than the minimal web page currently displays.
+- The implementation follows Basic HotStuff rather than Chained HotStuff or a pipelined production implementation.
+
+## Recommended reading order
+
+For understanding the source code, read the files in this order:
+
+1. `domain.go`
+2. `main.go`
+3. `network.go`
+4. `crypto.go`
+5. `node.go`
+6. `pacemaker.go`
+7. `state_machine.go`
+8. `visualization.go`
+9. `index.html`
+10. the test files

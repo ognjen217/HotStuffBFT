@@ -1,3 +1,3 @@
-module github.com/ognjen217/HotStuffBFT
+module hotstuff-simulator
 
-go 1.22
+go 1.23

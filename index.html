@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HotStuff Simulator</title>
+    <style>
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 24px;
+            font-family: Arial, sans-serif;
+            background: #f4f4f4;
+            color: #222;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        h1 { margin: 0 0 8px; }
+        h2 { margin: 0 0 12px; font-size: 18px; }
+
+        .description {
+            margin: 0 0 20px;
+            color: #666;
+        }
+
+        .scenario-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 20px;
+        }
+
+        button {
+            padding: 10px 14px;
+            border: 0;
+            border-radius: 4px;
+            background: #1976d2;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        button:hover { background: #125da7; }
+        button:disabled { opacity: 0.55; cursor: wait; }
+
+        .status {
+            margin-bottom: 12px;
+            color: #666;
+            font-size: 14px;
+        }
+
+        .panel {
+            margin-bottom: 20px;
+            padding: 16px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            background: white;
+        }
+
+        #sequence-diagram {
+            min-height: 420px;
+            overflow: auto;
+            display: grid;
+            place-items: center;
+            background: #fafafa;
+        }
+
+        .placeholder {
+            padding: 30px;
+            color: #777;
+            text-align: center;
+        }
+
+        .diagram-error {
+            padding: 20px;
+            color: #a00000;
+            white-space: pre-wrap;
+            font-family: monospace;
+        }
+
+        #log-screen {
+            height: 350px;
+            margin: 0;
+            padding: 14px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            background: #1e1e1e;
+            color: #00e676;
+            font: 13px/1.5 "Courier New", monospace;
+        }
+
+        @media (max-width: 700px) {
+            body { padding: 14px; }
+            button { flex: 1 1 45%; }
+            #sequence-diagram { min-height: 320px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>HotStuff BFT Simulator</h1>
+    <p class="description">Choose a scenario to view the live message sequence and protocol log.</p>
+
+    <div class="scenario-buttons">
+        <button data-scenario="happy">Happy Path</button>
+        <button data-scenario="silent-leader">Silent Leader</button>
+        <button data-scenario="byzantine-equivocation">Byzantine Equivocation</button>
+        <button data-scenario="banking-block-transfer">Banking Commands</button>
+        <button data-scenario="delayed-network">Delayed Network</button>
+    </div>
+
+    <div id="status" class="status">Status: idle</div>
+
+    <section class="panel">
+        <h2>Live Message Sequence</h2>
+        <div id="sequence-diagram">
+            <div class="placeholder">Run a scenario to display protocol messages.</div>
+        </div>
+    </section>
+
+    <section class="panel">
+        <h2>Protocol Log</h2>
+        <pre id="log-screen">Waiting for a scenario...</pre>
+    </section>
+</div>
+
+<script src="/assets/mermaid.min.js"></script>
+<script>
+    const mermaidAPI = window.mermaid;
+    const renderedSources = new Map();
+    let refreshBusy = false;
+    let renderCounter = 0;
+
+    mermaidAPI.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        theme: "default",
+        sequence: {
+            showSequenceNumbers: true,
+            wrap: true,
+            useMaxWidth: true
+        }
+    });
+
+    document.querySelectorAll("[data-scenario]").forEach(button => {
+        button.addEventListener("click", () => runScenario(button.dataset.scenario));
+    });
+
+    async function runScenario(scenario) {
+        setButtonsDisabled(true);
+        document.getElementById("status").textContent = `Status: starting ${scenario}`;
+        document.getElementById("log-screen").textContent = `Starting ${scenario}...\n`;
+
+        try {
+            const response = await fetch(`/run?scenario=${encodeURIComponent(scenario)}`, {
+                cache: "no-store"
+            });
+            if (!response.ok) throw new Error("Could not start scenario.");
+        } catch (error) {
+            document.getElementById("status").textContent = `Status: ${error.message}`;
+            setButtonsDisabled(false);
+        }
+
+        await refresh();
+    }
+
+    async function refresh() {
+        if (refreshBusy) return;
+        refreshBusy = true;
+
+        try {
+            const [stateResponse, logsResponse] = await Promise.all([
+                fetch("/visual-state", { cache: "no-store" }),
+                fetch("/logs", { cache: "no-store" })
+            ]);
+
+            if (!stateResponse.ok || !logsResponse.ok) {
+                throw new Error("Server endpoint returned an error.");
+            }
+
+            const [state, logs] = await Promise.all([
+                stateResponse.json(),
+                logsResponse.json()
+            ]);
+
+            updateStatus(state);
+            updateLogs(logs);
+            await renderSequence(state);
+            setButtonsDisabled(Boolean(state.running));
+        } catch (error) {
+            document.getElementById("status").textContent = "Status: disconnected";
+            console.error(error);
+        } finally {
+            refreshBusy = false;
+        }
+    }
+
+    function updateStatus(state) {
+        if (!state.scenario) {
+            document.getElementById("status").textContent = "Status: idle";
+            return;
+        }
+
+        const runState = state.running ? "running" : "completed";
+        document.getElementById("status").textContent =
+            `Status: ${runState} | Scenario: ${state.scenario} | View: ${state.current_view || "-"} | Leader: ${state.leader || "-"}`;
+    }
+
+    function updateLogs(lines) {
+        const screen = document.getElementById("log-screen");
+        const wasAtBottom = screen.scrollHeight - screen.clientHeight <= screen.scrollTop + 5;
+        screen.textContent = (lines || []).join("") || "Waiting for a scenario...";
+        if (wasAtBottom) screen.scrollTop = screen.scrollHeight;
+    }
+
+    async function renderSequence(state) {
+        const source = buildSequenceDiagram(state);
+        if (renderedSources.get("sequence-diagram") === source) return;
+
+        const container = document.getElementById("sequence-diagram");
+        try {
+            const result = await mermaidAPI.render(`sequence-${++renderCounter}`, source);
+            container.innerHTML = result.svg;
+            result.bindFunctions?.(container);
+            renderedSources.set("sequence-diagram", source);
+        } catch (error) {
+            container.innerHTML = `<div class="diagram-error">Diagram rendering error:\n${escapeHTML(error.message)}</div>`;
+        }
+    }
+
+    function buildSequenceDiagram(state) {
+        const lines = ["sequenceDiagram", "autonumber"];
+        lines.push("participant Client as Client");
+        lines.push("participant System as System");
+
+        const aliases = new Map([
+            ["Client", "Client"],
+            ["System", "System"]
+        ]);
+
+        (state.nodes || []).forEach((node, index) => {
+            const alias = `N${index + 1}`;
+            aliases.set(node.id, alias);
+            const label = node.role === "leader" ? `${node.id} (Leader)` : node.id;
+            lines.push(`participant ${alias} as ${safeMermaidText(label)}`);
+        });
+
+        const events = (state.events || []).slice(-45);
+        if (!events.length) {
+            lines.push("Note over Client,System: No messages recorded yet");
+            return lines.join("\n");
+        }
+
+        for (const event of events) {
+            const from = aliases.get(event.from);
+            const to = aliases.get(event.to);
+            if (!from || !to) continue;
+
+            let arrow = event.is_vote ? "-->>" : "->>";
+            if (event.delivery_state === "dropped" || event.delivery_state === "rejected") {
+                arrow = "--x";
+            }
+
+            lines.push(`${from}${arrow}${to}: ${safeMermaidText(sequenceLabel(event))}`);
+        }
+
+        return lines.join("\n");
+    }
+
+    function sequenceLabel(event) {
+        if (event.kind === "client-command") {
+            return `CLIENT ${event.command_type || "COMMAND"} ${event.command_id || ""}`.trim();
+        }
+        if (event.kind === "system") return event.detail || "system event";
+
+        const vote = event.is_vote ? " vote" : "";
+        const hash = event.node_hash ? ` | ${shortHash(event.node_hash)}` : "";
+        const qc = event.justify_type ? ` | ${event.justify_type}QC(v${event.justify_view})` : "";
+        const delivery = event.delivery_state && event.delivery_state !== "sent"
+            ? ` | ${event.delivery_state}`
+            : "";
+
+        return `${event.type}${vote} | v${event.view_number}${hash}${qc}${delivery}`;
+    }
+
+    function shortHash(value) {
+        if (!value) return "";
+        if (value === "GENESIS") return value;
+        return value.length > 10 ? `${value.slice(0, 10)}...` : value;
+    }
+
+    function safeMermaidText(value) {
+        return String(value ?? "")
+            .replace(/[\r\n]+/g, " ")
+            .replaceAll('"', "'")
+            .replaceAll(":", "-");
+    }
+
+    function escapeHTML(value) {
+        return String(value ?? "")
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+    }
+
+    function setButtonsDisabled(disabled) {
+        document.querySelectorAll("[data-scenario]").forEach(button => {
+            button.disabled = disabled;
+        });
+    }
+
+    refresh();
+    setInterval(refresh, 350);
+</script>
+</body>
+</html>
